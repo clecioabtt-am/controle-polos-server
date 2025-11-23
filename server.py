@@ -60,13 +60,141 @@ def teste():
     return jsonify({"mensagem": "Servidor funcionando com sucesso!"})
 
 
-# ========= LOGIN =========
+# ========= PAINEL /admin =========
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    partners = load_partners()
+    mensagem = ""
+
+    if request.method == "POST":
+        delete_key = (request.form.get("delete_key") or "").strip()
+
+        if delete_key:
+            if delete_key in partners:
+                info = partners.pop(delete_key)
+                save_partners(partners)
+                mensagem = f"Chave {delete_key} removida ({info.get('nome', 'Sem nome')})."
+            else:
+                mensagem = f"Chave {delete_key} não encontrada."
+        else:
+            nome = (request.form.get("nome") or "").strip()
+            polo = (request.form.get("polo") or "").strip()
+            expira_em = (request.form.get("expira_em") or "").strip()
+            chave_manual = (request.form.get("chave") or "").strip()
+
+            if not nome:
+                mensagem = "Preencha pelo menos o nome do parceiro."
+            else:
+                chave = chave_manual.upper() if chave_manual else generate_access_key()
+
+                partners[chave] = {
+                    "nome": nome,
+                    "polo": polo,
+                    "expira_em": expira_em
+                }
+                save_partners(partners)
+                mensagem = f"Chave gerada para {nome}: {chave}"
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="pt-br">
+    <head>
+        <meta charset="utf-8">
+        <title>Painel de Parceiros</title>
+        <style>
+            body {{
+                background: #0D47A1;
+                margin: 0;
+                padding: 0;
+                font-family: Arial, sans-serif;
+            }}
+            .container {{
+                max-width: 1100px;
+                margin: 40px auto;
+                background: white;
+                border-radius: 10px;
+                padding: 20px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+            }}
+            th, td {{
+                border-bottom: 1px solid #ddd;
+                padding: 8px;
+            }}
+            th {{
+                background: #f2f2f2;
+            }}
+            .msg {{
+                color: green;
+                margin-top: 10px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Painel de Parceiros</h1>
+            {"<div class='msg'>" + mensagem + "</div>" if mensagem else ""}
+            <form method="POST">
+                <p><b>Nome:</b> <input name="nome"></p>
+                <p><b>Polo:</b> <input name="polo"></p>
+                <p><b>Expira em:</b> <input name="expira_em" placeholder="2025-12-31"></p>
+                <p><b>Chave manual (opcional):</b> <input name="chave"></p>
+                <button type="submit">Salvar / Gerar Chave</button>
+            </form>
+
+            <h2>Chaves cadastradas</h2>
+            <table>
+                <tr>
+                    <th>Chave</th>
+                    <th>Nome</th>
+                    <th>Polo</th>
+                    <th>Expira em</th>
+                    <th>Status</th>
+                    <th>Ação</th>
+                </tr>
+    """
+
+    for chave, info in partners.items():
+        expira_em = info.get("expira_em", "")
+        exp = "Expirada" if is_expired(expira_em) else "Ativa"
+        cor = "red" if exp == "Expirada" else "green"
+
+        html += f"""
+            <tr>
+                <td>{chave}</td>
+                <td>{info.get('nome')}</td>
+                <td>{info.get('polo')}</td>
+                <td>{expira_em}</td>
+                <td style="color:{cor};">{exp}</td>
+                <td>
+                    <form method="POST">
+                        <input type="hidden" name="delete_key" value="{chave}">
+                        <button style="color:red;">Remover</button>
+                    </form>
+                </td>
+            </tr>
+        """
+
+    html += """
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+
+    return html
+
+
+# ========= LOGIN ANDROID =========
 @app.route("/login", methods=["POST"])
 def login():
     partners = load_partners()
     dados = request.get_json() or {}
 
     chave = (dados.get("chave_acesso") or "").strip().upper()
+
     if chave == "":
         return jsonify({"status": "erro", "mensagem": "Chave vazia"}), 400
 
@@ -96,60 +224,52 @@ def cadastrar_aluno():
         cpf = dados.get("cpf")
         comp = dados.get("complemento")
 
-        # validação
         if not nome or not cpf or not comp:
             return jsonify({
-                "success": False,
-                "message": "Campos obrigatórios: nome, cpf, complemento"
+                "status": "erro",
+                "mensagem": "Campos obrigatórios: nome, cpf, complemento"
             }), 400
 
-        # consulta aluno no Asaas
         url = f"{ASAAS_BASE_URL}/customers?cpfCnpj={cpf}"
         r = requests.get(url, headers=asaas_headers())
         r.raise_for_status()
         data = r.json()
 
-        # Se já existe → atualiza
         if data.get("totalCount", 0) > 0:
             aluno_id = data["data"][0]["id"]
-
             body = {
                 "name": nome,
                 "cpfCnpj": cpf,
                 "complement": comp
             }
-
             url_update = f"{ASAAS_BASE_URL}/customers/{aluno_id}"
             r = requests.post(url_update, headers=asaas_headers(), json=body)
             r.raise_for_status()
-
             return jsonify({
-                "success": True,
-                "message": "Cadastro atualizado com sucesso!",
+                "status": "ok",
+                "mensagem": "Cadastro atualizado com sucesso!",
                 "aluno_id": aluno_id
             })
 
-        # Se não existe → cria
         body = {
             "name": nome,
             "cpfCnpj": cpf,
             "complement": comp
         }
-
         r = requests.post(f"{ASAAS_BASE_URL}/customers", headers=asaas_headers(), json=body)
         r.raise_for_status()
         novo = r.json()
 
         return jsonify({
-            "success": True,
-            "message": "Aluno cadastrado com sucesso!",
+            "status": "ok",
+            "mensagem": "Aluno cadastrado com sucesso!",
             "aluno_id": novo.get("id")
         })
 
     except Exception as e:
         return jsonify({
-            "success": False,
-            "message": f"Erro ao cadastrar aluno: {str(e)}"
+            "status": "erro",
+            "mensagem": f"Erro ao cadastrar aluno: {str(e)}"
         }), 500
 
 
@@ -168,11 +288,10 @@ def emitir_fatura():
 
         if not nome or not cpf or not valor or not venc or not descricao:
             return jsonify({
-                "success": False,
-                "message": "Campos obrigatórios: nome, cpf, valor, vencimento, descricao"
+                "status": "erro",
+                "mensagem": "Campos obrigatórios: nome, cpf, valor, vencimento, descricao"
             }), 400
 
-        # Buscar cliente pelo CPF
         url_consulta = f"{ASAAS_BASE_URL}/customers?cpfCnpj={cpf}"
         r = requests.get(url_consulta, headers=asaas_headers())
         r.raise_for_status()
@@ -180,16 +299,14 @@ def emitir_fatura():
 
         if data.get("totalCount", 0) == 0:
             return jsonify({
-                "success": False,
-                "message": "Aluno não encontrado no Asaas para este CPF."
+                "status": "erro",
+                "mensagem": "Aluno não encontrado no Asaas para este CPF."
             }), 404
 
         aluno_id = data["data"][0]["id"]
 
-        # Billing type
         billing_type = "PIX" if forma == "PIX" else "BOLETO"
 
-        # Criar fatura
         payload = {
             "customer": aluno_id,
             "value": float(valor),
@@ -203,8 +320,8 @@ def emitir_fatura():
         fatura = r.json()
 
         return jsonify({
-            "success": True,
-            "message": "Fatura emitida com sucesso!",
+            "status": "ok",
+            "mensagem": "Fatura emitida com sucesso!",
             "fatura_id": fatura.get("id"),
             "link_pagamento": fatura.get("invoiceUrl"),
             "valor": fatura.get("value"),
@@ -213,12 +330,12 @@ def emitir_fatura():
 
     except Exception as e:
         return jsonify({
-            "success": False,
-            "message": f"Erro ao emitir fatura: {str(e)}"
+            "status": "erro",
+            "mensagem": f"Erro ao emitir fatura: {str(e)}"
         }), 500
 
 
-# ========= EXECUÇÃO =========
+# ========= EXECUÇÃO LOCAL =========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
