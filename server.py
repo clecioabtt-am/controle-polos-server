@@ -54,6 +54,35 @@ def is_expired(expira_em_str: str) -> bool:
     return date.today() > d
 
 
+# Helper: buscar todos clientes de um polo (complement = polo)
+def get_customers_by_polo(polo: str):
+    polo_norm = (polo or "").strip().lower()
+    clientes = []
+    url = f"{ASAAS_BASE_URL}/customers"
+    limit = 100
+    offset = 0
+
+    while True:
+        params = {"limit": limit, "offset": offset}
+        r = requests.get(url, headers=asaas_headers(), params=params)
+        r.raise_for_status()
+        data = r.json()
+        lista = data.get("data", [])
+        if not lista:
+            break
+
+        for c in lista:
+            comp = (c.get("complement") or "").strip().lower()
+            if comp == polo_norm:
+                clientes.append(c)
+
+        if len(lista) < limit:
+            break
+        offset += limit
+
+    return clientes
+
+
 # ========= TESTE =========
 @app.route("/teste", methods=["GET"])
 def teste():
@@ -333,6 +362,243 @@ def emitir_fatura():
             "status": "erro",
             "mensagem": f"Erro ao emitir fatura: {str(e)}"
         }), 500
+
+
+# ========= ROTA: VERIFICAR FATURAS =========
+@app.route("/api/verificar_faturas", methods=["POST"])
+def verificar_faturas():
+    try:
+        dados = request.get_json() or {}
+        nome = dados.get("nome")
+        cpf = dados.get("cpf")
+
+        if not nome or not cpf:
+            return jsonify({"status": "erro", "mensagem": "Campos obrigatórios: nome, cpf"}), 400
+
+        url = f"{ASAAS_BASE_URL}/customers?cpfCnpj={cpf}"
+        r = requests.get(url, headers=asaas_headers())
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("totalCount") == 0:
+            return jsonify({"status": "erro", "mensagem": "Aluno não encontrado."}), 404
+
+        aluno_id = data["data"][0]["id"]
+
+        url_pay = f"{ASAAS_BASE_URL}/payments"
+        r = requests.get(url_pay, headers=asaas_headers(), params={"customer": aluno_id, "limit": 100})
+        r.raise_for_status()
+        lista = r.json().get("data", [])
+
+        faturas = []
+        for fat in lista:
+            faturas.append({
+                "id": fat.get("id"),
+                "valor": fat.get("value"),
+                "vencimento": fat.get("dueDate"),
+                "status": fat.get("status"),
+                "forma": fat.get("billingType"),
+                "descricao": fat.get("description"),
+                "link_pagamento": fat.get("invoiceUrl")
+            })
+
+        return jsonify({
+            "status": "ok",
+            "mensagem": f"{len(faturas)} faturas encontradas.",
+            "faturas": faturas
+        })
+
+    except Exception as e:
+        return jsonify({"status": "erro", "mensagem": f"Erro ao verificar faturas: {str(e)}"}), 500
+
+
+# ========= ROTA: ÚLTIMO LINK DE PAGAMENTO =========
+@app.route("/api/ultimo_link_pagamento", methods=["POST"])
+def ultimo_link_pagamento():
+    try:
+        dados = request.get_json() or {}
+        nome = dados.get("nome")
+        cpf = dados.get("cpf")
+
+        if not nome or not cpf:
+            return jsonify({"status": "erro", "mensagem": "Campos obrigatórios: nome, cpf"}), 400
+
+        url = f"{ASAAS_BASE_URL}/customers?cpfCnpj={cpf}"
+        r = requests.get(url, headers=asaas_headers())
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("totalCount") == 0:
+            return jsonify({"status": "erro", "mensagem": "Aluno não encontrado."}), 404
+
+        aluno_id = data["data"][0]["id"]
+
+        url_pay = f"{ASAAS_BASE_URL}/payments"
+        r = requests.get(url_pay, headers=asaas_headers(), params={"customer": aluno_id, "limit": 100})
+        r.raise_for_status()
+        lista = r.json().get("data", [])
+
+        if not lista:
+            return jsonify({"status": "erro", "mensagem": "Nenhuma fatura encontrada."}), 404
+
+        lista_ordenada = sorted(lista, key=lambda x: x.get("dueDate") or "")
+        ultima = lista_ordenada[-1]
+
+        return jsonify({
+            "status": "ok",
+            "mensagem": "Última fatura localizada.",
+            "fatura_id": ultima.get("id"),
+            "descricao": ultima.get("description"),
+            "valor": ultima.get("value"),
+            "vencimento": ultima.get("dueDate"),
+            "link_pagamento": ultima.get("invoiceUrl")
+        })
+
+    except Exception as e:
+        return jsonify({"status": "erro", "mensagem": f"Erro ao buscar último link: {str(e)}"}), 500
+
+
+# ========= ROTA: RELATÓRIO POR POLO - HISTÓRICO =========
+@app.route("/api/relatorio_polo_historico", methods=["POST"])
+def relatorio_polo_historico():
+    try:
+        dados = request.get_json() or {}
+        polo = dados.get("polo")
+
+        if not polo:
+            return jsonify({"status": "erro", "mensagem": "Campo obrigatório: polo"}), 400
+
+        clientes = get_customers_by_polo(polo)
+        if not clientes:
+            return jsonify({"status": "erro", "mensagem": f"Nenhum cliente encontrado para o polo {polo}."}), 404
+
+        registros = []
+
+        for cli in clientes:
+            aluno_id = cli.get("id")
+            nome = cli.get("name")
+            cpf = cli.get("cpfCnpj")
+            comp = cli.get("complement")
+
+            url_pay = f"{ASAAS_BASE_URL}/payments"
+            r = requests.get(url_pay, headers=asaas_headers(), params={"customer": aluno_id, "limit": 100})
+            r.raise_for_status()
+            lista = r.json().get("data", [])
+
+            for fat in lista:
+                registros.append({
+                    "nome": nome,
+                    "cpf": cpf,
+                    "polo": comp,
+                    "fatura_id": fat.get("id"),
+                    "descricao": fat.get("description"),
+                    "valor": fat.get("value"),
+                    "valor_liquido": fat.get("netValue"),
+                    "vencimento": fat.get("dueDate"),
+                    "status": fat.get("status"),
+                    "data_pagamento": fat.get("paymentDate"),
+                    "link_pagamento": fat.get("invoiceUrl")
+                })
+
+        registros.sort(key=lambda x: (x.get("nome") or "", x.get("vencimento") or ""))
+
+        return jsonify({
+            "status": "ok",
+            "mensagem": f"{len(registros)} faturas encontradas para o polo {polo}.",
+            "polo": polo,
+            "faturas": registros
+        })
+
+    except Exception as e:
+        return jsonify({"status": "erro", "mensagem": f"Erro ao gerar relatório por polo (histórico): {str(e)}"}), 500
+
+
+# ========= ROTA: RELATÓRIO POR POLO - PAGAMENTOS =========
+@app.route("/api/relatorio_polo_pagamentos", methods=["POST"])
+def relatorio_polo_pagamentos():
+    try:
+        dados = request.get_json() or {}
+        polo = dados.get("polo")
+        data_inicial = dados.get("data_inicial")
+        data_final = dados.get("data_final")
+
+        if not polo or not data_inicial or not data_final:
+            return jsonify({
+                "status": "erro",
+                "mensagem": "Campos obrigatórios: polo, data_inicial, data_final"
+            }), 400
+
+        try:
+            dt_ini = datetime.strptime(data_inicial, "%Y-%m-%d").date()
+            dt_fim = datetime.strptime(data_final, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify({
+                "status": "erro",
+                "mensagem": "Datas devem estar no formato YYYY-MM-DD"
+            }), 400
+
+        clientes = get_customers_by_polo(polo)
+        if not clientes:
+            return jsonify({"status": "erro", "mensagem": f"Nenhum cliente encontrado para o polo {polo}."}), 404
+
+        pagamentos = []
+
+        for cli in clientes:
+            aluno_id = cli.get("id")
+            nome = cli.get("name")
+            cpf = cli.get("cpfCnpj")
+            comp = cli.get("complement")
+
+            url_pay = f"{ASAAS_BASE_URL}/payments"
+            r = requests.get(url_pay, headers=asaas_headers(), params={"customer": aluno_id, "limit": 100})
+            r.raise_for_status()
+            lista = r.json().get("data", [])
+
+            for fat in lista:
+                status = fat.get("status")
+                if status != "RECEIVED":
+                    continue
+
+                pay_date_str = fat.get("paymentDate")
+                if not pay_date_str:
+                    continue
+
+                try:
+                    pay_date = datetime.strptime(pay_date_str, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+
+                if not (dt_ini <= pay_date <= dt_fim):
+                    continue
+
+                valor_liq = fat.get("netValue") if fat.get("netValue") is not None else fat.get("value")
+
+                pagamentos.append({
+                    "nome": nome,
+                    "cpf": cpf,
+                    "polo": comp,
+                    "fatura_id": fat.get("id"),
+                    "descricao": fat.get("description"),
+                    "valor_liquido": valor_liq,
+                    "data_pagamento": pay_date_str,
+                    "vencimento": fat.get("dueDate"),
+                    "status": status,
+                    "link_pagamento": fat.get("invoiceUrl")
+                })
+
+        pagamentos.sort(key=lambda x: x.get("data_pagamento") or "")
+
+        return jsonify({
+            "status": "ok",
+            "mensagem": f"{len(pagamentos)} pagamentos encontrados para o polo {polo}.",
+            "polo": polo,
+            "data_inicial": data_inicial,
+            "data_final": data_final,
+            "pagamentos": pagamentos
+        })
+
+    except Exception as e:
+        return jsonify({"status": "erro", "mensagem": f"Erro ao gerar relatório por polo (pagamentos): {str(e)}"}), 500
 
 
 # ========= EXECUÇÃO LOCAL =========
