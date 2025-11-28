@@ -1,13 +1,20 @@
 from flask import Flask, request, jsonify
 import os
-import json
 import secrets
 from datetime import datetime, date
 import requests
+from flask_sqlalchemy import SQLAlchemy
 
 app = Flask(__name__)
 
-PARTNERS_FILE = "partners.json"
+# ========= CONFIG BANCO DE DADOS (PARCEIROS) =========
+# Em produção (Render), configure a env DATABASE_URL apontando para o PostgreSQL
+# Ex.: postgres://user:senha@host:5432/dbname
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///partners.db")
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
+
 
 # ========= CONFIG ASAAS =========
 ASAAS_API_KEY = os.getenv("ASAAS_API_KEY", "SUA_CHAVE_API_AQUI")
@@ -22,26 +29,35 @@ def asaas_headers():
     }
 
 
+# ========= MODELO DO BANCO =========
+class Partner(db.Model):
+    __tablename__ = "partners"
+
+    chave = db.Column(db.String(32), primary_key=True)
+    nome = db.Column(db.String(200), nullable=False)
+    polo = db.Column(db.String(200))
+    expira_em = db.Column(db.String(10))  # formato "YYYY-MM-DD" (string mesmo)
+
+    def to_dict(self):
+        return {
+            "chave": self.chave,
+            "nome": self.nome,
+            "polo": self.polo,
+            "expira_em": self.expira_em,
+        }
+
+
 # ========= UTILITÁRIOS =========
-def load_partners():
-    if not os.path.exists(PARTNERS_FILE):
-        return {}
-    try:
-        with open(PARTNERS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        return {}
-
-
-def save_partners(data):
-    with open(PARTNERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-
 def generate_access_key():
-    raw = secrets.token_urlsafe(8)
-    key = "".join(ch for ch in raw if ch.isalnum()).upper()
-    return key[:12]
+    """
+    Gera uma chave aleatória de 12 caracteres (A-Z, 0-9) e garante que não exista igual no banco.
+    """
+    while True:
+        raw = secrets.token_urlsafe(8)
+        key = "".join(ch for ch in raw if ch.isalnum()).upper()
+        key = key[:12]
+        if not Partner.query.get(key):
+            return key
 
 
 def is_expired(expira_em_str: str) -> bool:
@@ -115,17 +131,18 @@ def teste():
 # ========= PAINEL /admin =========
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
-    partners = load_partners()
     mensagem = ""
 
     if request.method == "POST":
         delete_key = (request.form.get("delete_key") or "").strip()
 
         if delete_key:
-            if delete_key in partners:
-                info = partners.pop(delete_key)
-                save_partners(partners)
-                mensagem = f"Chave {delete_key} removida ({info.get('nome', 'Sem nome')})."
+            parceiro = Partner.query.get(delete_key)
+            if parceiro:
+                nome = parceiro.nome
+                db.session.delete(parceiro)
+                db.session.commit()
+                mensagem = f"Chave {delete_key} removida ({nome})."
             else:
                 mensagem = f"Chave {delete_key} não encontrada."
         else:
@@ -137,15 +154,30 @@ def admin():
             if not nome:
                 mensagem = "Preencha pelo menos o nome do parceiro."
             else:
-                chave = chave_manual.upper() if chave_manual else generate_access_key()
+                if chave_manual:
+                    chave = chave_manual.upper()
+                    parceiro = Partner.query.get(chave)
+                    if parceiro:
+                        # atualiza o registro existente
+                        parceiro.nome = nome
+                        parceiro.polo = polo
+                        parceiro.expira_em = expira_em
+                    else:
+                        parceiro = Partner(
+                            chave=chave, nome=nome, polo=polo, expira_em=expira_em
+                        )
+                        db.session.add(parceiro)
+                else:
+                    chave = generate_access_key()
+                    parceiro = Partner(
+                        chave=chave, nome=nome, polo=polo, expira_em=expira_em
+                    )
+                    db.session.add(parceiro)
 
-                partners[chave] = {
-                    "nome": nome,
-                    "polo": polo,
-                    "expira_em": expira_em,
-                }
-                save_partners(partners)
+                db.session.commit()
                 mensagem = f"Chave gerada para {nome}: {chave}"
+
+    parceiros = Partner.query.order_by(Partner.nome.asc()).all()
 
     html = f"""
     <!DOCTYPE html>
@@ -208,21 +240,21 @@ def admin():
                 </tr>
     """
 
-    for chave, info in partners.items():
-        expira_em = info.get("expira_em", "")
+    for parceiro in parceiros:
+        expira_em = parceiro.expira_em or ""
         exp = "Expirada" if is_expired(expira_em) else "Ativa"
         cor = "red" if exp == "Expirada" else "green"
 
         html += f"""
             <tr>
-                <td>{chave}</td>
-                <td>{info.get('nome')}</td>
-                <td>{info.get('polo')}</td>
+                <td>{parceiro.chave}</td>
+                <td>{parceiro.nome}</td>
+                <td>{parceiro.polo or ""}</td>
                 <td>{expira_em}</td>
                 <td style="color:{cor};">{exp}</td>
                 <td>
                     <form method="POST">
-                        <input type="hidden" name="delete_key" value="{chave}">
+                        <input type="hidden" name="delete_key" value="{parceiro.chave}">
                         <button style="color:red;">Remover</button>
                     </form>
                 </td>
@@ -242,7 +274,6 @@ def admin():
 # ========= LOGIN ANDROID =========
 @app.route("/login", methods=["POST"])
 def login():
-    partners = load_partners()
     dados = request.get_json() or {}
 
     chave = (dados.get("chave_acesso") or "").strip().upper()
@@ -250,20 +281,20 @@ def login():
     if chave == "":
         return jsonify({"status": "erro", "mensagem": "Chave vazia"}), 400
 
-    info = partners.get(chave)
-    if not info:
+    parceiro = Partner.query.get(chave)
+    if not parceiro:
         return jsonify({"status": "erro", "mensagem": "Chave inválida"}), 401
 
-    if is_expired(info.get("expira_em", "")):
+    if is_expired(parceiro.expira_em or ""):
         return jsonify({"status": "erro", "mensagem": "Chave expirada"}), 403
 
     return jsonify(
         {
             "status": "ok",
             "mensagem": "Acesso autorizado",
-            "polo": info.get("polo"),
-            "parceiro": info.get("nome"),
-            "chave": chave,
+            "polo": parceiro.polo,
+            "parceiro": parceiro.nome,
+            "chave": parceiro.chave,
         }
     )
 
@@ -857,6 +888,11 @@ def relatorio_polo_pagamentos():
             ),
             500,
         )
+
+
+# ========= CRIAR TABELAS (SE NÃO EXISTIR) =========
+with app.app_context():
+    db.create_all()
 
 
 # ========= EXECUÇÃO LOCAL =========
