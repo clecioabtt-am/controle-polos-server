@@ -15,26 +15,17 @@ db = SQLAlchemy(app)
 
 # ========= CHAVES FIXAS (NUNCA APAGAM) =========
 FIXED_KEYS = {
-    "JAINA.POLO": {
-        "nome": "Jaina",
-        "polo": "Polo Jaina",
-        "expira_em": None,
-    },
-    "GABRIEL.POLO": {
-        "nome": "Gabriel",
-        "polo": "Polo Gabriel",
-        "expira_em": None,
-    },
-    "LUCIANO.POLO": {
-        "nome": "Luciano",
-        "polo": "Polo Luciano",
-        "expira_em": None,
-    },
+    "JAINA.POLO": {"nome": "Jaina", "polo": "Polo Jaina", "expira_em": None},
+    "GABRIEL.POLO": {"nome": "Gabriel", "polo": "Polo Gabriel", "expira_em": None},
+    "LUCIANO.POLO": {"nome": "Luciano", "polo": "Polo Luciano", "expira_em": None},
 }
 
 # ========= CONFIG ASAAS =========
 ASAAS_API_KEY = os.getenv("ASAAS_API_KEY", "SUA_CHAVE_API_AQUI")
 ASAAS_BASE_URL = os.getenv("ASAAS_BASE_URL", "https://www.asaas.com/api/v3")
+
+# Timeout padrão de rede (segurança)
+DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "30"))
 
 
 def asaas_headers():
@@ -112,25 +103,28 @@ def ensure_asaas_configured():
     return True, None
 
 
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+
 # Helper: buscar todos clientes de um polo (complement = polo)
-def get_customers_by_polo(polo: str):
-    polo_norm = (polo or "").strip().lower()
+# OBS: isso ainda varre o /customers inteiro. Mantive por compatibilidade,
+# mas agora tem trava de loops.
+def get_customers_by_polo(polo: str, *, max_loops: int = 50, limit: int = 100):
+    polo_norm = _norm(polo)
     clientes = []
     url = f"{ASAAS_BASE_URL}/customers"
-    limit = 100
     offset = 0
 
-    # Segurança para não ficar em loop infinito
-    max_loops = 50
+    session = requests.Session()
 
     for _ in range(max_loops):
         try:
             params = {"limit": limit, "offset": offset}
-            r = requests.get(url, headers=asaas_headers(), params=params, timeout=30)
+            r = session.get(url, headers=asaas_headers(), params=params, timeout=DEFAULT_TIMEOUT)
             r.raise_for_status()
             data = r.json()
         except Exception:
-            # Se der erro numa página, interrompe e devolve o que já encontrou
             break
 
         lista = data.get("data", [])
@@ -138,7 +132,7 @@ def get_customers_by_polo(polo: str):
             break
 
         for c in lista:
-            comp = (c.get("complement") or "").strip().lower()
+            comp = _norm(c.get("complement"))
             if comp == polo_norm:
                 clientes.append(c)
 
@@ -164,7 +158,6 @@ def admin():
         delete_key = (request.form.get("delete_key") or "").strip()
 
         if delete_key:
-            # Impede deletar chaves fixas
             if delete_key in FIXED_KEYS:
                 mensagem = f"A chave {delete_key} é fixa e não pode ser removida."
             else:
@@ -185,7 +178,6 @@ def admin():
                 mensagem = "Preencha pelo menos o nome do parceiro."
             else:
                 if chave_manual:
-                    # Não deixa sobrescrever fixa
                     if chave_manual in FIXED_KEYS:
                         mensagem = "Você não pode sobrescrever uma chave fixa."
                     else:
@@ -327,10 +319,9 @@ def admin():
 @app.route("/login", methods=["POST"])
 def login():
     dados = request.get_json() or {}
-
     chave = (dados.get("chave_acesso") or "").strip().upper()
 
-    if chave == "":
+    if not chave:
         return jsonify({"status": "erro", "mensagem": "Chave vazia"}), 400
 
     parceiro = Partner.query.get(chave)
@@ -360,25 +351,18 @@ def cadastrar_aluno():
 
     try:
         dados = request.get_json() or {}
-
         nome = dados.get("nome")
         cpf = dados.get("cpf")
         comp = dados.get("complemento")
 
         if not nome or not cpf or not comp:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": "Campos obrigatórios: nome, cpf, complemento",
-                    }
-                ),
-                400,
-            )
+            return jsonify({"status": "erro", "mensagem": "Campos obrigatórios: nome, cpf, complemento"}), 400
+
+        session = requests.Session()
 
         url = f"{ASAAS_BASE_URL}/customers"
         params = {"cpfCnpj": cpf}
-        r = requests.get(url, headers=asaas_headers(), params=params, timeout=30)
+        r = session.get(url, headers=asaas_headers(), params=params, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
@@ -386,53 +370,21 @@ def cadastrar_aluno():
             aluno_id = data["data"][0]["id"]
             body = {"name": nome, "cpfCnpj": cpf, "complement": comp}
             url_update = f"{ASAAS_BASE_URL}/customers/{aluno_id}"
-            r = requests.post(
-                url_update, headers=asaas_headers(), json=body, timeout=30
-            )
+            r = session.post(url_update, headers=asaas_headers(), json=body, timeout=DEFAULT_TIMEOUT)
             r.raise_for_status()
-            return jsonify(
-                {
-                    "status": "ok",
-                    "mensagem": "Cadastro atualizado com sucesso!",
-                    "aluno_id": aluno_id,
-                }
-            )
+            return jsonify({"status": "ok", "mensagem": "Cadastro atualizado com sucesso!", "aluno_id": aluno_id})
 
         body = {"name": nome, "cpfCnpj": cpf, "complement": comp}
-        r = requests.post(
-            f"{ASAAS_BASE_URL}/customers",
-            headers=asaas_headers(),
-            json=body,
-            timeout=30,
-        )
+        r = session.post(f"{ASAAS_BASE_URL}/customers", headers=asaas_headers(), json=body, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
         novo = r.json()
 
-        return jsonify(
-            {
-                "status": "ok",
-                "mensagem": "Aluno cadastrado com sucesso!",
-                "aluno_id": novo.get("id"),
-            }
-        )
+        return jsonify({"status": "ok", "mensagem": "Aluno cadastrado com sucesso!", "aluno_id": novo.get("id")})
 
     except requests.RequestException as e:
-        return (
-            jsonify(
-                {
-                    "status": "erro",
-                    "mensagem": f"Erro de comunicação com Asaas: {str(e)}",
-                }
-            ),
-            502,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro de comunicação com Asaas: {str(e)}"}), 502
     except Exception as e:
-        return (
-            jsonify(
-                {"status": "erro", "mensagem": f"Erro ao cadastrar aluno: {str(e)}"}
-            ),
-            500,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro ao cadastrar aluno: {str(e)}"}), 500
 
 
 # ========= ROTA: EMITIR FATURA =========
@@ -444,7 +396,6 @@ def emitir_fatura():
 
     try:
         dados = request.get_json() or {}
-
         nome = dados.get("nome")
         cpf = dados.get("cpf")
         valor = dados.get("valor")
@@ -453,35 +404,20 @@ def emitir_fatura():
         descricao = dados.get("descricao")
 
         if not nome or not cpf or not valor or not venc or not descricao:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": "Campos obrigatórios: nome, cpf, valor, vencimento, descricao",
-                    }
-                ),
-                400,
-            )
+            return jsonify({"status": "erro", "mensagem": "Campos obrigatórios: nome, cpf, valor, vencimento, descricao"}), 400
+
+        session = requests.Session()
 
         url_consulta = f"{ASAAS_BASE_URL}/customers"
         params = {"cpfCnpj": cpf}
-        r = requests.get(url_consulta, headers=asaas_headers(), params=params, timeout=30)
+        r = session.get(url_consulta, headers=asaas_headers(), params=params, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
         if data.get("totalCount", 0) == 0:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": "Aluno não encontrado no Asaas para este CPF.",
-                    }
-                ),
-                404,
-            )
+            return jsonify({"status": "erro", "mensagem": "Aluno não encontrado no Asaas para este CPF."}), 404
 
         aluno_id = data["data"][0]["id"]
-
         billing_type = "PIX" if forma == "PIX" else "BOLETO"
 
         payload = {
@@ -492,12 +428,7 @@ def emitir_fatura():
             "billingType": billing_type,
         }
 
-        r = requests.post(
-            f"{ASAAS_BASE_URL}/payments",
-            headers=asaas_headers(),
-            json=payload,
-            timeout=30,
-        )
+        r = session.post(f"{ASAAS_BASE_URL}/payments", headers=asaas_headers(), json=payload, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
         fatura = r.json()
 
@@ -513,22 +444,9 @@ def emitir_fatura():
         )
 
     except requests.RequestException as e:
-        return (
-            jsonify(
-                {
-                    "status": "erro",
-                    "mensagem": f"Erro de comunicação com Asaas: {str(e)}",
-                }
-            ),
-            502,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro de comunicação com Asaas: {str(e)}"}), 502
     except Exception as e:
-        return (
-            jsonify(
-                {"status": "erro", "mensagem": f"Erro ao emitir fatura: {str(e)}"}
-            ),
-            500,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro ao emitir fatura: {str(e)}"}), 500
 
 
 # ========= ROTA: VERIFICAR FATURAS =========
@@ -544,37 +462,23 @@ def verificar_faturas():
         cpf = dados.get("cpf")
 
         if not nome or not cpf:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": "Campos obrigatórios: nome, cpf",
-                    }
-                ),
-                400,
-            )
+            return jsonify({"status": "erro", "mensagem": "Campos obrigatórios: nome, cpf"}), 400
+
+        session = requests.Session()
 
         url = f"{ASAAS_BASE_URL}/customers"
         params = {"cpfCnpj": cpf}
-        r = requests.get(url, headers=asaas_headers(), params=params, timeout=30)
+        r = session.get(url, headers=asaas_headers(), params=params, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
         if data.get("totalCount") == 0:
-            return (
-                jsonify({"status": "erro", "mensagem": "Aluno não encontrado."}),
-                404,
-            )
+            return jsonify({"status": "erro", "mensagem": "Aluno não encontrado."}), 404
 
         aluno_id = data["data"][0]["id"]
 
         url_pay = f"{ASAAS_BASE_URL}/payments"
-        r = requests.get(
-            url_pay,
-            headers=asaas_headers(),
-            params={"customer": aluno_id, "limit": 100},
-            timeout=30,
-        )
+        r = session.get(url_pay, headers=asaas_headers(), params={"customer": aluno_id, "limit": 100}, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
         lista = r.json().get("data", [])
 
@@ -592,31 +496,12 @@ def verificar_faturas():
                 }
             )
 
-        return jsonify(
-            {
-                "status": "ok",
-                "mensagem": f"{len(faturas)} faturas encontradas.",
-                "faturas": faturas,
-            }
-        )
+        return jsonify({"status": "ok", "mensagem": f"{len(faturas)} faturas encontradas.", "faturas": faturas})
 
     except requests.RequestException as e:
-        return (
-            jsonify(
-                {
-                    "status": "erro",
-                    "mensagem": f"Erro de comunicação com Asaas: {str(e)}",
-                }
-            ),
-            502,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro de comunicação com Asaas: {str(e)}"}), 502
     except Exception as e:
-        return (
-            jsonify(
-                {"status": "erro", "mensagem": f"Erro ao verificar faturas: {str(e)}"}
-            ),
-            500,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro ao verificar faturas: {str(e)}"}), 500
 
 
 # ========= ROTA: ÚLTIMO LINK DE PAGAMENTO =========
@@ -632,50 +517,28 @@ def ultimo_link_pagamento():
         cpf = dados.get("cpf")
 
         if not nome or not cpf:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": "Campos obrigatórios: nome, cpf",
-                    }
-                ),
-                400,
-            )
+            return jsonify({"status": "erro", "mensagem": "Campos obrigatórios: nome, cpf"}), 400
+
+        session = requests.Session()
 
         url = f"{ASAAS_BASE_URL}/customers"
         params = {"cpfCnpj": cpf}
-        r = requests.get(url, headers=asaas_headers(), params=params, timeout=30)
+        r = session.get(url, headers=asaas_headers(), params=params, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
         data = r.json()
 
         if data.get("totalCount") == 0:
-            return (
-                jsonify({"status": "erro", "mensagem": "Aluno não encontrado."}),
-                404,
-            )
+            return jsonify({"status": "erro", "mensagem": "Aluno não encontrado."}), 404
 
         aluno_id = data["data"][0]["id"]
 
         url_pay = f"{ASAAS_BASE_URL}/payments"
-        r = requests.get(
-            url_pay,
-            headers=asaas_headers(),
-            params={"customer": aluno_id, "limit": 100},
-            timeout=30,
-        )
+        r = session.get(url_pay, headers=asaas_headers(), params={"customer": aluno_id, "limit": 100}, timeout=DEFAULT_TIMEOUT)
         r.raise_for_status()
         lista = r.json().get("data", [])
 
         if not lista:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": "Nenhuma fatura encontrada.",
-                    }
-                ),
-                404,
-            )
+            return jsonify({"status": "erro", "mensagem": "Nenhuma fatura encontrada."}), 404
 
         lista_ordenada = sorted(lista, key=lambda x: x.get("dueDate") or "")
         ultima = lista_ordenada[-1]
@@ -693,25 +556,12 @@ def ultimo_link_pagamento():
         )
 
     except requests.RequestException as e:
-        return (
-            jsonify(
-                {
-                    "status": "erro",
-                    "mensagem": f"Erro de comunicação com Asaas: {str(e)}",
-                }
-            ),
-            502,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro de comunicação com Asaas: {str(e)}"}), 502
     except Exception as e:
-        return (
-            jsonify(
-                {"status": "erro", "mensagem": f"Erro ao buscar último link: {str(e)}"}
-            ),
-            500,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro ao buscar último link: {str(e)}"}), 500
 
 
-# ========= ROTA: RELATÓRIO POR POLO - HISTÓRICO =========
+# ========= ROTA: RELATÓRIO POR POLO - HISTÓRICO (OTIMIZADA) =========
 @app.route("/api/relatorio_polo_historico", methods=["POST"])
 def relatorio_polo_historico():
     ok, resp_err = ensure_asaas_configured()
@@ -722,27 +572,39 @@ def relatorio_polo_historico():
         dados = request.get_json() or {}
         polo = dados.get("polo")
 
+        # filtros opcionais (recomendado)
+        data_inicial = dados.get("data_inicial")  # "YYYY-MM-DD" (opcional) -> usa paymentDate
+        data_final = dados.get("data_final")      # "YYYY-MM-DD" (opcional) -> usa paymentDate
+        status_filtro = (dados.get("status") or "").strip().upper()  # ex: RECEIVED
+
+        # limites anti-SIGKILL (ajuste conforme sua realidade)
+        max_clientes = int(dados.get("max_clientes", 300))
+        max_faturas_por_cliente = int(dados.get("max_faturas_cliente", 50))
+        max_registros = int(dados.get("max_registros", 5000))
+
         if not polo:
-            return (
-                jsonify({"status": "erro", "mensagem": "Campo obrigatório: polo"}),
-                400,
-            )
+            return jsonify({"status": "erro", "mensagem": "Campo obrigatório: polo"}), 400
+
+        dt_ini = None
+        dt_fim = None
+        if data_inicial:
+            dt_ini = datetime.strptime(data_inicial, "%Y-%m-%d").date()
+        if data_final:
+            dt_fim = datetime.strptime(data_final, "%Y-%m-%d").date()
 
         clientes = get_customers_by_polo(polo)
         if not clientes:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": f"Nenhum cliente encontrado para o polo {polo}.",
-                    }
-                ),
-                404,
-            )
+            return jsonify({"status": "erro", "mensagem": f"Nenhum cliente encontrado para o polo {polo}."}), 404
+
+        clientes = clientes[:max_clientes]
 
         registros = []
+        session = requests.Session()
 
         for cli in clientes:
+            if len(registros) >= max_registros:
+                break
+
             aluno_id = cli.get("id")
             nome = cli.get("name")
             cpf = cli.get("cpfCnpj")
@@ -750,19 +612,40 @@ def relatorio_polo_historico():
 
             try:
                 url_pay = f"{ASAAS_BASE_URL}/payments"
-                r = requests.get(
+                r = session.get(
                     url_pay,
                     headers=asaas_headers(),
-                    params={"customer": aluno_id, "limit": 100},
-                    timeout=30,
+                    params={"customer": aluno_id, "limit": max_faturas_por_cliente},
+                    timeout=DEFAULT_TIMEOUT,
                 )
                 r.raise_for_status()
                 lista = r.json().get("data", [])
             except Exception:
-                # Se der erro para um cliente, apenas ignora esse cliente
                 continue
 
             for fat in lista:
+                if len(registros) >= max_registros:
+                    break
+
+                st = (fat.get("status") or "").upper()
+                if status_filtro and st != status_filtro:
+                    continue
+
+                pay_date_str = fat.get("paymentDate")
+
+                # filtro por período baseado em paymentDate
+                if dt_ini or dt_fim:
+                    if not pay_date_str:
+                        continue
+                    try:
+                        pay_date = datetime.strptime(pay_date_str, "%Y-%m-%d").date()
+                    except ValueError:
+                        continue
+                    if dt_ini and pay_date < dt_ini:
+                        continue
+                    if dt_fim and pay_date > dt_fim:
+                        continue
+
                 registros.append(
                     {
                         "nome": nome,
@@ -773,8 +656,8 @@ def relatorio_polo_historico():
                         "valor": fat.get("value"),
                         "valor_liquido": fat.get("netValue"),
                         "vencimento": fat.get("dueDate"),
-                        "status": fat.get("status"),
-                        "data_pagamento": fat.get("paymentDate"),
+                        "status": st,
+                        "data_pagamento": pay_date_str,
                         "link_pagamento": fat.get("invoiceUrl"),
                     }
                 )
@@ -784,25 +667,20 @@ def relatorio_polo_historico():
         return jsonify(
             {
                 "status": "ok",
-                "mensagem": f"{len(registros)} faturas encontradas para o polo {polo}.",
+                "mensagem": f"{len(registros)} registros retornados (limitado para evitar travamento).",
                 "polo": polo,
+                "max_clientes": max_clientes,
+                "max_faturas_cliente": max_faturas_por_cliente,
+                "max_registros": max_registros,
                 "faturas": registros,
             }
         )
 
     except Exception as e:
-        return (
-            jsonify(
-                {
-                    "status": "erro",
-                    "mensagem": f"Erro ao gerar relatório por polo (histórico): {str(e)}",
-                }
-            ),
-            500,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro ao gerar relatório por polo (histórico): {str(e)}"}), 500
 
 
-# ========= ROTA: RELATÓRIO POR POLO - PAGAMENTOS =========
+# ========= ROTA: RELATÓRIO POR POLO - PAGAMENTOS (OTIMIZADA) =========
 @app.route("/api/relatorio_polo_pagamentos", methods=["POST"])
 def relatorio_polo_pagamentos():
     ok, resp_err = ensure_asaas_configured()
@@ -815,46 +693,33 @@ def relatorio_polo_pagamentos():
         data_inicial = dados.get("data_inicial")
         data_final = dados.get("data_final")
 
+        # limites (ajuste conforme sua realidade)
+        max_clientes = int(dados.get("max_clientes", 300))
+        max_faturas_por_cliente = int(dados.get("max_faturas_cliente", 100))
+        max_pagamentos = int(dados.get("max_pagamentos", 5000))
+
         if not polo or not data_inicial or not data_final:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": "Campos obrigatórios: polo, data_inicial, data_final",
-                    }
-                ),
-                400,
-            )
+            return jsonify({"status": "erro", "mensagem": "Campos obrigatórios: polo, data_inicial, data_final"}), 400
 
         try:
             dt_ini = datetime.strptime(data_inicial, "%Y-%m-%d").date()
             dt_fim = datetime.strptime(data_final, "%Y-%m-%d").date()
         except ValueError:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": "Datas devem estar no formato YYYY-MM-DD",
-                    }
-                ),
-                400,
-            )
+            return jsonify({"status": "erro", "mensagem": "Datas devem estar no formato YYYY-MM-DD"}), 400
 
         clientes = get_customers_by_polo(polo)
         if not clientes:
-            return (
-                jsonify(
-                    {
-                        "status": "erro",
-                        "mensagem": f"Nenhum cliente encontrado para o polo {polo}.",
-                    }
-                ),
-                404,
-            )
+            return jsonify({"status": "erro", "mensagem": f"Nenhum cliente encontrado para o polo {polo}."}), 404
+
+        clientes = clientes[:max_clientes]
 
         pagamentos = []
+        session = requests.Session()
 
         for cli in clientes:
+            if len(pagamentos) >= max_pagamentos:
+                break
+
             aluno_id = cli.get("id")
             nome = cli.get("name")
             cpf = cli.get("cpfCnpj")
@@ -862,11 +727,11 @@ def relatorio_polo_pagamentos():
 
             try:
                 url_pay = f"{ASAAS_BASE_URL}/payments"
-                r = requests.get(
+                r = session.get(
                     url_pay,
                     headers=asaas_headers(),
-                    params={"customer": aluno_id, "limit": 100},
-                    timeout=30,
+                    params={"customer": aluno_id, "limit": max_faturas_por_cliente},
+                    timeout=DEFAULT_TIMEOUT,
                 )
                 r.raise_for_status()
                 lista = r.json().get("data", [])
@@ -874,7 +739,10 @@ def relatorio_polo_pagamentos():
                 continue
 
             for fat in lista:
-                status = fat.get("status")
+                if len(pagamentos) >= max_pagamentos:
+                    break
+
+                status = (fat.get("status") or "").upper()
                 if status != "RECEIVED":
                     continue
 
@@ -890,11 +758,7 @@ def relatorio_polo_pagamentos():
                 if not (dt_ini <= pay_date <= dt_fim):
                     continue
 
-                valor_liq = (
-                    fat.get("netValue")
-                    if fat.get("netValue") is not None
-                    else fat.get("value")
-                )
+                valor_liq = fat.get("netValue") if fat.get("netValue") is not None else fat.get("value")
 
                 pagamentos.append(
                     {
@@ -920,20 +784,15 @@ def relatorio_polo_pagamentos():
                 "polo": polo,
                 "data_inicial": data_inicial,
                 "data_final": data_final,
+                "max_clientes": max_clientes,
+                "max_faturas_cliente": max_faturas_por_cliente,
+                "max_pagamentos": max_pagamentos,
                 "pagamentos": pagamentos,
             }
         )
 
     except Exception as e:
-        return (
-            jsonify(
-                {
-                    "status": "erro",
-                    "mensagem": f"Erro ao gerar relatório por polo (pagamentos): {str(e)}",
-                }
-            ),
-            500,
-        )
+        return jsonify({"status": "erro", "mensagem": f"Erro ao gerar relatório por polo (pagamentos): {str(e)}"}), 500
 
 
 # ========= CRIAR TABELAS + INSERIR CHAVES FIXAS =========
